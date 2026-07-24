@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# local packaging output (release tarballs)
+/release

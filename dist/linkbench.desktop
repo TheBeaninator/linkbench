@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=linkbench
+Comment=Benchmark the link between two compute nodes for ML work
+Exec=linkbench-gui
+Terminal=false
+Categories=Development;Utility;Network;
+Keywords=benchmark;network;rdma;roce;ml;
