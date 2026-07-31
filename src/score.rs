@@ -32,6 +32,11 @@ pub struct ScoreCard {
     pub bandwidth_axis: f64,
     pub latency_axis: f64,
     pub penalties: Vec<String>,
+    /// Checks that could not run on this link (too-short timeline, single QP,
+    /// missing latency sample). A score with skipped checks is an optimistic
+    /// upper bound and says so rather than quietly omitting the penalty.
+    #[serde(default)]
+    pub skipped: Vec<String>,
     pub hint: String,
 }
 
@@ -62,34 +67,41 @@ pub fn compute(r: &Results) -> ScoreCard {
 
     let mut combined = (bandwidth_axis * latency_axis).sqrt();
     let mut penalties = Vec::new();
+    let mut skipped = Vec::new();
 
-    let stalled = [
+    let stats: Vec<_> = [
         (&r.timeline_up_bps, r.timeline_up_steady),
         (&r.timeline_down_bps, r.timeline_down_steady),
     ]
     .iter()
     .filter_map(|(b, s)| timeline_stats(b, *s))
-    .any(|s| s.stalls > 0);
+    .collect();
+    if stats.is_empty() {
+        skipped.push("sustained-throughput stability (timeline too short)".into());
+    }
+    let stalled = stats.iter().any(|s| s.stalls > 0);
     if stalled {
         combined *= 0.85;
         penalties.push("sustained-throughput stalls (−15%)".into());
     }
 
-    if let (Some(l), Some(idle)) = (
-        &r.loaded_rtt,
-        r.latency.iter().find(|p| p.size == 16 * 1024),
-    ) {
-        if l.p50_us / (idle.oneway_p50_us * 2.0).max(0.1) > 10.0 {
-            combined *= 0.9;
-            penalties.push("bufferbloat under load (−10%)".into());
+    match (&r.loaded_rtt, crate::report::latency_near(r, 16 * 1024)) {
+        (Some(l), Some(idle)) => {
+            if l.p50_us / (idle.oneway_p50_us * 2.0).max(0.1) > crate::report::BLOAT_POOR_X {
+                combined *= 0.9;
+                penalties.push("bufferbloat under load (−10%)".into());
+            }
         }
+        // Single-QP devices skip the loaded-latency test entirely, so this
+        // penalty can never fire for them — that must be visible.
+        _ => skipped.push("latency under load (needs ≥2 QPs/streams)".into()),
     }
 
     if let (Some(hot), Some(cold)) = (
         r.idle_gaps.first(),
         r.idle_gaps.iter().find(|g| g.gap_ms >= 100),
     ) {
-        if cold.rtt_p50_us - hot.rtt_p50_us > 500.0 {
+        if cold.rtt_p50_us - hot.rtt_p50_us > crate::report::WAKEUP_POOR_US {
             combined *= 0.95;
             penalties.push("after-idle wake-up lag (−5%)".into());
         }
@@ -109,6 +121,7 @@ pub fn compute(r: &Results) -> ScoreCard {
         bandwidth_axis,
         latency_axis,
         penalties,
+        skipped,
         hint: hint.into(),
     }
 }

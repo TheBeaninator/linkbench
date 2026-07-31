@@ -53,6 +53,22 @@ GPU compute is a separate axis for when GPU probing lands. Reference
 points: 10GbE ≈ 2.5, TB4 ≈ 3.5, m5↔m6 TCP ≈ 3.6, hardware-RDMA 100GbE ≈
 6, NVLink = 10. Anchors are frozen per era — hence the year in the name.
 
+## Reading a report on modest hardware
+
+Two things are worth knowing before comparing scores across machines.
+
+**The score reports what it could not check.** A link with a single QP skips
+the latency-under-load test, and a very short run produces too few timeline
+buckets to judge stability. Those checks are listed under the score as
+`not checked: … — score is an upper bound`, because a penalty that cannot fire
+is not the same as a penalty that did not apply.
+
+**Device-granted limits show up in the path line.** The one-line summary now
+reports the queue depths and inline size the device actually granted, e.g.
+`… inline 0B, 1 QP, sq/rq 64/64`. If a link underperforms its wire rate, look
+here first: a single QP with no inline caps small-message rate far below what
+the bandwidth alone would suggest.
+
 ## Transports
 
 - **tcp** — works between any two machines, no setup, multi-stream.

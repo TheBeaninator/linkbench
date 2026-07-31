@@ -163,6 +163,22 @@ fn bar(value: f64, max: f64, width: usize) -> String {
     "█".repeat(n.max(1))
 }
 
+/// Thresholds shared by the verdicts and the score, so the narrative and the
+/// number can never disagree. The rule: the score penalizes exactly when a
+/// verdict reads `Poor`. (A USB4 run showed +250 µs of wake-up lag — graded
+/// Poor, penalized not at all, because these lived in two places.)
+pub const BLOAT_POOR_X: f64 = 10.0;
+pub const WAKEUP_POOR_US: f64 = 200.0;
+
+/// The latency sample nearest `target` bytes. Callers used to match the sweep
+/// size exactly, so a sweep that skipped 16 KiB silently produced NaN verdicts
+/// and disabled the bufferbloat penalty.
+pub fn latency_near(r: &Results, target: u64) -> Option<&crate::bench::LatencyPoint> {
+    r.latency
+        .iter()
+        .min_by_key(|p| (p.size as i64 - target as i64).unsigned_abs())
+}
+
 pub enum Grade {
     Good(String),
     Ok(String),
@@ -186,10 +202,7 @@ pub fn verdicts(r: &Results) -> Vec<(String, Grade)> {
         },
     ));
 
-    let hop = r
-        .latency
-        .iter()
-        .find(|l| l.size == 16 * KIB)
+    let hop = latency_near(r, 16 * KIB)
         .map(|l| l.oneway_p50_us)
         .unwrap_or(f64::NAN);
     v.push((
@@ -254,10 +267,7 @@ pub fn verdicts(r: &Results) -> Vec<(String, Grade)> {
     }
 
     if let Some(l) = &r.loaded_rtt {
-        let idle = r
-            .latency
-            .iter()
-            .find(|p| p.size == 16 * KIB)
+        let idle = latency_near(r, 16 * KIB)
             .map(|p| p.oneway_p50_us * 2.0)
             .unwrap_or(f64::NAN);
         let x = l.p50_us / idle.max(0.1);
@@ -265,7 +275,7 @@ pub fn verdicts(r: &Results) -> Vec<(String, Grade)> {
             "latency while link is saturated (serving + bulk)".into(),
             if x < 3.0 {
                 Grade::Good(format!("×{x:.1} inflation — fine to serve during transfers"))
-            } else if x < 10.0 {
+            } else if x < BLOAT_POOR_X {
                 Grade::Ok(format!("×{x:.1} inflation — schedule bulk moves off-peak"))
             } else {
                 Grade::Poor(format!("×{x:.1} inflation (bufferbloat) — don't serve during bulk transfers"))
@@ -282,7 +292,7 @@ pub fn verdicts(r: &Results) -> Vec<(String, Grade)> {
             "wake-up after idle (bursty pipeline traffic)".into(),
             if extra < 40.0 {
                 Grade::Good(format!("+{extra:.0} µs after 100 ms idle — no warm-up penalty"))
-            } else if extra < 200.0 {
+            } else if extra < WAKEUP_POOR_US {
                 Grade::Ok(format!("+{extra:.0} µs after 100 ms idle (coalescing/power states)"))
             } else {
                 Grade::Poor(format!("+{extra:.0} µs after 100 ms idle — bursty workloads will feel this"))
@@ -360,6 +370,12 @@ pub fn render(r: &Results) {
     println!("  {}", st.dim(&card.hint));
     for p in &card.penalties {
         println!("  {}", st.warn(&format!("penalty: {p}")));
+    }
+    for s in &card.skipped {
+        println!(
+            "  {}",
+            st.dim(&format!("not checked: {s} — score is an upper bound"))
+        );
     }
 
     // --- microbenchmarks

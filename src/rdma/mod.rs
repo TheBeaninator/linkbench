@@ -98,8 +98,17 @@ fn choose_gid_index(device: &str, port: u8) -> (i32, [u8; 16]) {
 
 // --------------------------------------------------------------- discovery
 
-/// The network interface backing an RDMA device: rxe exposes `parent`,
-/// hardware devices expose `device/net/<ifname>`.
+/// The network interface backing an RDMA device. Three layouts in the wild:
+/// rxe (Soft-RoCE) exposes `parent`; classic hardware exposes
+/// `device/net/<ifname>`; and newer stacks (USB4/Thunderbolt RDMA, some
+/// virtual functions) expose neither, keeping the association only in the
+/// per-port `gid_attrs/ndevs/<i>` files.
+///
+/// Returning `None` here means "could not determine" — NOT "no interface".
+/// Callers must not infer that traffic will take the wrong path from a failed
+/// lookup: a USB4 RDMA device reported no netdev by the first two methods and
+/// the resulting warning wrongly told a tester their results were invalid
+/// (2026-07-31).
 pub fn device_netdev(device: &str) -> Option<String> {
     let base = format!("/sys/class/infiniband/{device}");
     if let Ok(parent) = std::fs::read_to_string(format!("{base}/parent")) {
@@ -108,11 +117,28 @@ pub fn device_netdev(device: &str) -> Option<String> {
             return Some(p.to_string());
         }
     }
-    std::fs::read_dir(format!("{base}/device/net"))
-        .ok()?
-        .flatten()
-        .next()
+    if let Some(name) = std::fs::read_dir(format!("{base}/device/net"))
+        .ok()
+        .and_then(|d| d.flatten().next())
         .map(|e| e.file_name().to_string_lossy().into_owned())
+    {
+        return Some(name);
+    }
+    // Port GID attributes name the backing netdev even when the device tree
+    // does not. Ports and GID indices are both small; scan the first few.
+    for port in 1..=2 {
+        for idx in 0..16 {
+            if let Ok(nd) =
+                std::fs::read_to_string(format!("{base}/ports/{port}/gid_attrs/ndevs/{idx}"))
+            {
+                let nd = nd.trim();
+                if !nd.is_empty() {
+                    return Some(nd.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn list_devices() -> Result<Vec<RdmaDeviceInfo>> {
@@ -173,6 +199,13 @@ struct QpUnit {
     tx_lkey: u32,
     rx_lkey: u32,
     max_inline: u32,
+    /// Work-request depths the device actually GRANTED, read back from
+    /// `ibv_create_qp`. Never assume the requested depth: a device may grant
+    /// fewer, and posting past its real depth fails with EINVAL on send or
+    /// starves the peer into RNR-retry-exceeded on receive. Found on a USB4
+    /// RDMA device that also granted 1 QP and 0 B inline (2026-07-31).
+    max_send_wr: u32,
+    max_recv_wr: u32,
 }
 
 unsafe impl Send for QpUnit {}
@@ -181,6 +214,19 @@ unsafe impl Sync for QpUnit {}
 impl QpUnit {
     fn slots_for(&self, size: usize) -> usize {
         (self.region / size.max(1)).clamp(1, MAX_SLOTS)
+    }
+
+    /// Deepest safe in-flight send window: bounded by buffer slots AND by the
+    /// depth the device granted, with headroom so a burst never rides the rim.
+    fn send_window(&self, size: usize) -> u64 {
+        let cap = (self.max_send_wr as usize).saturating_sub(16).max(1);
+        self.slots_for(size).min(cap) as u64
+    }
+
+    /// Same, for the receive queue.
+    fn recv_window(&self, size: usize) -> u64 {
+        let cap = (self.max_recv_wr as usize).saturating_sub(16).max(1);
+        self.slots_for(size).min(cap) as u64
     }
 
     unsafe fn post_send_slot(&self, slot: usize, size: usize) -> Result<()> {
@@ -246,7 +292,7 @@ impl QpUnit {
 
     fn send_burst(&self, size: usize, count: u64) -> Result<()> {
         let slots = self.slots_for(size);
-        let window = slots.min(SQ_DEPTH as usize - 16) as u64;
+        let window = self.send_window(size);
         let mut posted: u64 = 0;
         let mut done: u64 = 0;
         let mut wcs = [ibv_wc::default(); 64];
@@ -264,7 +310,7 @@ impl QpUnit {
 
     fn recv_burst(&self, size: usize, count: u64) -> Result<Option<(Instant, Instant)>> {
         let slots = self.slots_for(size);
-        let window = slots.min(RQ_DEPTH as usize - 16) as u64;
+        let window = self.recv_window(size);
         let mut posted: u64 = 0;
         let mut done: u64 = 0;
         let mut first: Option<Instant> = None;
@@ -294,8 +340,8 @@ impl QpUnit {
 
     fn bidir_burst(&self, size: usize, count: u64) -> Result<Option<(Instant, Instant)>> {
         let slots = self.slots_for(size);
-        let send_window = slots.min(SQ_DEPTH as usize - 16) as u64;
-        let recv_window = slots.min(RQ_DEPTH as usize - 16) as u64;
+        let send_window = self.send_window(size);
+        let recv_window = self.recv_window(size);
         let (mut s_posted, mut s_done) = (0u64, 0u64);
         let (mut r_posted, mut r_done) = (0u64, 0u64);
         let mut first: Option<Instant> = None;
@@ -340,7 +386,7 @@ impl QpUnit {
         bucket: std::time::Duration,
     ) -> Result<(Option<(Instant, Instant)>, Vec<u64>)> {
         let slots = self.slots_for(size);
-        let window = slots.min(RQ_DEPTH as usize - 16) as u64;
+        let window = self.recv_window(size);
         let mut posted: u64 = 0;
         let mut done: u64 = 0;
         let mut first: Option<Instant> = None;
@@ -637,9 +683,22 @@ impl RdmaPlane {
                     init.cap.max_inline_data = 0;
                     qp = (verbs.ibv_create_qp)(pd, &mut init);
                 }
+                // Then walk the depths down: a modest device may refuse 512
+                // outright rather than granting fewer. Halving beats failing.
+                while qp.is_null() && init.cap.max_send_wr > 16 {
+                    init.cap.max_send_wr /= 2;
+                    init.cap.max_recv_wr /= 2;
+                    qp = (verbs.ibv_create_qp)(pd, &mut init);
+                }
                 if qp.is_null() {
                     return Err(os_err("ibv_create_qp"));
                 }
+                // ibv_create_qp writes the GRANTED caps back into `init.cap`,
+                // which may be smaller than requested in every field. Honour
+                // them: posting past the real depth is EINVAL on send and
+                // RNR-retry-exceeded on receive.
+                let granted_send_wr = init.cap.max_send_wr.max(1);
+                let granted_recv_wr = init.cap.max_recv_wr.max(1);
 
                 // RESET -> INIT
                 let mut attr = ibv_qp_attr::default();
@@ -669,6 +728,8 @@ impl RdmaPlane {
                     tx_lkey: (*tx_mr).lkey,
                     rx_lkey: (*rx_mr).lkey,
                     max_inline: init.cap.max_inline_data,
+                    max_send_wr: granted_send_wr,
+                    max_recv_wr: granted_recv_wr,
                 });
             }
 
@@ -828,15 +889,20 @@ impl DataPlane for RdmaPlane {
     }
 
     fn describe(&self) -> String {
+        // Report the depths the device GRANTED, not what we asked for — when
+        // a link underperforms, a shallow queue or missing inline is usually
+        // the reason, and it should be visible in the one-line path summary.
         format!(
-            "device {} (on {}) gid[{}] {} mtu {} inline {}B, {} QP",
+            "device {} (on {}) gid[{}] {} mtu {} inline {}B, {} QP, sq/rq {}/{}",
             self.local_ep.device,
-            device_netdev(&self.local_ep.device).unwrap_or_else(|| "?".into()),
+            device_netdev(&self.local_ep.device).unwrap_or_else(|| "unknown".into()),
             self.local_ep.gid_index,
             gid_to_string(&self.local_ep.gid),
             mtu_to_enum_bytes(self.local_ep.mtu),
             self.units[0].max_inline,
             self.units.len(),
+            self.units[0].max_send_wr,
+            self.units[0].max_recv_wr,
         )
     }
 

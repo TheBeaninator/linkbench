@@ -501,15 +501,35 @@ fn run(
                     chosen_device = Some(dev);
                     true
                 }
-                // Explicit device that does NOT route to the target: the
-                // user forced both knobs, so proceed — but say it loudly.
+                // Explicit device that did not match the route. Two very
+                // different cases, and conflating them once told a tester
+                // their perfectly good USB4 RDMA results were invalid:
+                //   * we could not work out which interface backs the device
+                //     — say so, and say nothing about where data will flow;
+                //   * we know its interface and it differs from the route —
+                //     that is the real warning.
                 (Some(dev), None) => {
-                    eprintln!(
-                        "WARNING: RDMA device {dev} is not on the interface that routes to {} ({}); \
-                         data will NOT flow over the link you addressed",
-                        addr,
-                        route_if.as_deref().unwrap_or("unknown")
-                    );
+                    let backing = local_devs
+                        .iter()
+                        .find(|d| d.name == *dev)
+                        .map(|d| d.netdev.as_str())
+                        .filter(|n| !n.is_empty());
+                    match backing {
+                        Some(nd) => eprintln!(
+                            "WARNING: RDMA device {dev} rides {nd}, but {} routes over {}; \
+                             data will NOT flow over the link you addressed",
+                            addr,
+                            route_if.as_deref().unwrap_or("unknown")
+                        ),
+                        None => eprintln!(
+                            "NOTE: could not determine which interface backs RDMA device {dev} \
+                             (control connection to {} routes over {}). RDMA data egresses via \
+                             the device itself, so this is usually fine — but the path is \
+                             unverified; confirm with the counters on the interface you expect.",
+                            addr,
+                            route_if.as_deref().unwrap_or("unknown")
+                        ),
+                    }
                     true
                 }
                 (None, None) => bail!(
