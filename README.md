@@ -3,6 +3,13 @@
 One question, one pane: **how fast and useful is the link between these two
 computers, in the context of common machine-learning tasks?**
 
+![linkbench GUI: TCP and RDMA measured back to back over a 100G link between two nodes, showing a LinkBench2026 score of 5.9, 57.3 Gb/s each way, 2.4 µs one-way latency, and a per-workload verdict list](docs/linkbench.png)
+
+*The same 100G wire in both modes: RDMA takes the 16 KiB all-reduce from
+27 µs to 14 µs and the message rate from 11.9 to 18.1 M/s — the difference
+between "fine for bulk transfer" and "per-token tensor-parallel decode is
+viable."*
+
 Runs a suite of practical tests between two nodes and renders a single
 report: raw microbenchmarks (latency, bandwidth sweep, message rate), then
 the same numbers translated into ML terms — pipeline-parallel activation
